@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -13,7 +14,8 @@ import yt_dlp
 from telegram import InputMediaPhoto, InputMediaVideo, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
-from yt_dlp.utils import sanitize_filename
+from yt_dlp.networking import Request
+from yt_dlp.utils import decode_base_n, sanitize_filename
 
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
@@ -45,6 +47,19 @@ SUPPORTED_DOMAINS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Same encoding yt-dlp's Instagram extractor uses to turn a post's shortcode
+# into its internal numeric media id ("pk").
+_IG_SHORTCODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_IG_SHORTCODE_RE = re.compile(r"instagram\.com/(?:[^/]+/)?(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
+# Same public app id yt-dlp's Instagram extractor sends with its own API calls.
+_IG_API_HEADERS = {
+    "X-IG-App-ID": "936619743392459",
+    "X-ASBD-ID": "198387",
+    "X-IG-WWW-Claim": "0",
+    "Origin": "https://www.instagram.com",
+    "Accept": "*/*",
+}
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -62,17 +77,49 @@ def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[str]:
     return [ydl.prepare_filename(info)]
 
 
-def _download_image(ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str) -> str | None:
-    """Instagram's extractor only ever populates 'formats' for videos, so a
-    plain photo post (or a photo inside a carousel/"set") never has anything
-    yt-dlp's normal download pipeline will fetch. Grab the highest-res
-    thumbnail URL ourselves instead, reusing yt-dlp's own request handling
-    (cookies, headers, proxy) via ydl.urlopen."""
-    thumbnails = item.get("thumbnails") or []
-    if not thumbnails:
+def _instagram_shortcode_to_pk(shortcode: str) -> int:
+    if len(shortcode) > 28:
+        shortcode = shortcode[:-28]
+    return decode_base_n(shortcode, table=_IG_SHORTCODE_CHARS)
+
+
+def _fetch_instagram_raw_media(ydl: "yt_dlp.YoutubeDL", url: str) -> list[dict]:
+    """yt-dlp's Instagram extractor discards each photo's real
+    image_versions2.candidates before returning its result - it only keeps
+    resolution info for videos, so photo-only items come back as low-res
+    square crops (or nothing at all). Re-fetch the same media-info endpoint
+    the extractor itself uses, reusing its cookies/session, to get the real
+    per-item candidate list."""
+    match = _IG_SHORTCODE_RE.search(url)
+    if not match:
+        return []
+    pk = _instagram_shortcode_to_pk(match.group(1))
+    resp = ydl.urlopen(Request(
+        f"https://i.instagram.com/api/v1/media/{pk}/info/", headers=_IG_API_HEADERS,
+    ))
+    data = json.loads(resp.read())
+    item = (data.get("items") or [None])[0]
+    if not item:
+        return []
+    return item.get("carousel_media") or [item]
+
+
+def _best_candidate_url(candidates: list[dict]) -> str | None:
+    if not candidates:
         return None
-    best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
-    img_url = best.get("url")
+    best = max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+    return best.get("url")
+
+
+def _download_image(
+    ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str, raw_media: dict | None = None
+) -> str | None:
+    """Fetch the full-resolution photo for an item that has no video
+    formats. Prefers the raw Instagram media-info candidates (real
+    resolution); falls back to whatever yt-dlp's own (often low-res or
+    absent) 'thumbnails' list has if that lookup wasn't available."""
+    candidates = ((raw_media or {}).get("image_versions2") or {}).get("candidates") or []
+    img_url = _best_candidate_url(candidates) or _best_candidate_url(item.get("thumbnails") or [])
     if not img_url:
         return None
 
@@ -81,7 +128,8 @@ def _download_image(ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str) -> str |
     ext = mimetypes.guess_extension(content_type) or ".jpg"
     if ext == ".jpe":
         ext = ".jpg"
-    name = sanitize_filename(str(item.get("id") or uuid.uuid4().hex), restricted=True)
+    raw_id = (raw_media or {}).get("code") or (raw_media or {}).get("id") or item.get("id") or uuid.uuid4().hex
+    name = sanitize_filename(str(raw_id), restricted=True)
     path = os.path.join(dest_dir, f"{name}{ext}")
     with open(path, "wb") as f:
         f.write(resp.read())
@@ -115,8 +163,15 @@ def download_media(url: str, dest_dir: str) -> list[str]:
         raw = ydl.extract_info(url, download=False, process=False)
         items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
 
+        raw_media_list = []
+        if "instagram.com" in url.lower():
+            try:
+                raw_media_list = _fetch_instagram_raw_media(ydl, url)
+            except Exception as exc:  # noqa: BLE001 - fall back to yt-dlp's (weaker) data
+                log.warning("couldn't fetch raw Instagram media info for %s: %s", url, exc)
+
         paths = []
-        for item in items:
+        for i, item in enumerate(items):
             if not item:
                 continue
             try:
@@ -128,7 +183,8 @@ def download_media(url: str, dest_dir: str) -> list[str]:
                     processed = ydl.process_ie_result(item, download=True)
                     paths.extend(_paths_from_processed(ydl, processed))
                 else:
-                    path = _download_image(ydl, item, dest_dir)
+                    raw_media = raw_media_list[i] if i < len(raw_media_list) else None
+                    path = _download_image(ydl, item, dest_dir, raw_media)
                     if path:
                         paths.append(path)
             except Exception as exc:  # noqa: BLE001 - one bad carousel item shouldn't sink the rest
