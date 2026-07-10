@@ -1,0 +1,15 @@
+# Copy this file to config.yaml and fill in your values.
+# Get bot_token from @BotFather on Telegram.
+bot_token: ""
+
+# Optional: directory to use for temporary downloads before they're sent
+# to Telegram (each download gets its own subfolder, auto-deleted after
+# sending). Created if it doesn't exist. Leave blank to use the system
+# default temp directory.
+temp_dir: ""
+
+# Optional: path to a cookies.txt file (Netscape format) exported from a
+# logged-in browser session. Needed for Instagram reels that anonymous
+# yt-dlp requests can't fetch (rate-limited / login-gated / private-to-you).
+# Leave blank to try anonymous downloads only.
+cookies_file: ""

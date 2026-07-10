@@ -1,0 +1,13 @@
+[Unit]
+Description=telegram-reel-bot
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/telegram-reel-bot
+ExecStart=/opt/telegram-reel-bot/venv/bin/python bot.py
+Environment=CONFIG_PATH=/opt/telegram-reel-bot/config.yaml
+Restart=on-failure
+User=telegram-reel-bot
+
+[Install]
+WantedBy=multi-user.target
