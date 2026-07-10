@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import mimetypes
 import os
 import re
 import tempfile
+import threading
 import uuid
 
 import yaml
 import yt_dlp
+import yt_dlp.extractor.instagram as _ig_extractor
 from telegram import InputMediaPhoto, InputMediaVideo, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
-from yt_dlp.networking import Request
-from yt_dlp.utils import decode_base_n, sanitize_filename
+from yt_dlp.utils import sanitize_filename
 
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
@@ -47,18 +47,9 @@ SUPPORTED_DOMAINS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Same encoding yt-dlp's Instagram extractor uses to turn a post's shortcode
-# into its internal numeric media id ("pk").
-_IG_SHORTCODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-_IG_SHORTCODE_RE = re.compile(r"instagram\.com/(?:[^/]+/)?(?:p|reel|tv)/([^/?#]+)", re.IGNORECASE)
-# Same public app id yt-dlp's Instagram extractor sends with its own API calls.
-_IG_API_HEADERS = {
-    "X-IG-App-ID": "936619743392459",
-    "X-ASBD-ID": "198387",
-    "X-IG-WWW-Claim": "0",
-    "Origin": "https://www.instagram.com",
-    "Accept": "*/*",
-}
+# Guards the monkeypatch below so concurrent Instagram downloads (across
+# different chats) can't race on the same patched method.
+_ig_capture_lock = threading.Lock()
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -75,33 +66,6 @@ def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[str]:
     if downloads:
         return [d["filepath"] for d in downloads if d.get("filepath")]
     return [ydl.prepare_filename(info)]
-
-
-def _instagram_shortcode_to_pk(shortcode: str) -> int:
-    if len(shortcode) > 28:
-        shortcode = shortcode[:-28]
-    return decode_base_n(shortcode, table=_IG_SHORTCODE_CHARS)
-
-
-def _fetch_instagram_raw_media(ydl: "yt_dlp.YoutubeDL", url: str) -> list[dict]:
-    """yt-dlp's Instagram extractor discards each photo's real
-    image_versions2.candidates before returning its result - it only keeps
-    resolution info for videos, so photo-only items come back as low-res
-    square crops (or nothing at all). Re-fetch the same media-info endpoint
-    the extractor itself uses, reusing its cookies/session, to get the real
-    per-item candidate list."""
-    match = _IG_SHORTCODE_RE.search(url)
-    if not match:
-        return []
-    pk = _instagram_shortcode_to_pk(match.group(1))
-    resp = ydl.urlopen(Request(
-        f"https://i.instagram.com/api/v1/media/{pk}/info/", headers=_IG_API_HEADERS,
-    ))
-    data = json.loads(resp.read())
-    item = (data.get("items") or [None])[0]
-    if not item:
-        return []
-    return item.get("carousel_media") or [item]
 
 
 def _best_candidate_url(candidates: list[dict]) -> str | None:
@@ -128,7 +92,12 @@ def _download_image(
     ext = mimetypes.guess_extension(content_type) or ".jpg"
     if ext == ".jpe":
         ext = ".jpg"
-    raw_id = (raw_media or {}).get("code") or (raw_media or {}).get("id") or item.get("id") or uuid.uuid4().hex
+    raw_id = (
+        (raw_media or {}).get("code")
+        or (raw_media or {}).get("pk")
+        or item.get("id")
+        or uuid.uuid4().hex
+    )
     name = sanitize_filename(str(raw_id), restricted=True)
     path = os.path.join(dest_dir, f"{name}{ext}")
     with open(path, "wb") as f:
@@ -156,40 +125,59 @@ def download_media(url: str, dest_dir: str) -> list[str]:
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # process=False skips yt-dlp's format-selection/download pipeline
-        # entirely, so a photo-only item (no video formats) doesn't hard-fail
-        # extraction before we even get to see the rest of the post/carousel.
-        raw = ydl.extract_info(url, download=False, process=False)
-        items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
+    def run(captured_media: list[dict]) -> list[str]:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # process=False skips yt-dlp's format-selection/download pipeline
+            # entirely, so a photo-only item (no video formats) doesn't
+            # hard-fail extraction before we see the rest of the post.
+            raw = ydl.extract_info(url, download=False, process=False)
+            items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
 
-        raw_media_list = []
-        if "instagram.com" in url.lower():
-            try:
-                raw_media_list = _fetch_instagram_raw_media(ydl, url)
-            except Exception as exc:  # noqa: BLE001 - fall back to yt-dlp's (weaker) data
-                log.warning("couldn't fetch raw Instagram media info for %s: %s", url, exc)
+            paths = []
+            for i, item in enumerate(items):
+                if not item:
+                    continue
+                try:
+                    if item.get("formats") or item.get("url"):
+                        # Carry over fields normally set on the outer result
+                        # so process_ie_result has what it needs for a bare
+                        # entry.
+                        for key in ("extractor", "extractor_key", "webpage_url"):
+                            item.setdefault(key, raw.get(key))
+                        processed = ydl.process_ie_result(item, download=True)
+                        paths.extend(_paths_from_processed(ydl, processed))
+                    else:
+                        raw_media = captured_media[i] if i < len(captured_media) else None
+                        path = _download_image(ydl, item, dest_dir, raw_media)
+                        if path:
+                            paths.append(path)
+                except Exception as exc:  # noqa: BLE001 - one bad carousel item shouldn't sink the rest
+                    log.warning("skipping one item of %s: %s", url, exc)
+            return paths
 
-        paths = []
-        for i, item in enumerate(items):
-            if not item:
-                continue
-            try:
-                if item.get("formats") or item.get("url"):
-                    # Carry over fields normally set on the outer result so
-                    # process_ie_result has what it needs for a bare entry.
-                    for key in ("extractor", "extractor_key", "webpage_url"):
-                        item.setdefault(key, raw.get(key))
-                    processed = ydl.process_ie_result(item, download=True)
-                    paths.extend(_paths_from_processed(ydl, processed))
-                else:
-                    raw_media = raw_media_list[i] if i < len(raw_media_list) else None
-                    path = _download_image(ydl, item, dest_dir, raw_media)
-                    if path:
-                        paths.append(path)
-            except Exception as exc:  # noqa: BLE001 - one bad carousel item shouldn't sink the rest
-                log.warning("skipping one item of %s: %s", url, exc)
-        return paths
+    if "instagram.com" not in url.lower():
+        return run([])
+
+    # yt-dlp's Instagram extractor throws away each photo's real
+    # image_versions2.candidates before returning its result to us - it only
+    # preserves resolution data for videos, which is why photo items came
+    # through as tiny square crops (or nothing). Intercept the raw API data
+    # right where the extractor itself fetches it (same request, same
+    # cookies/session that's already proven to work) before it gets
+    # discarded, instead of guessing at a separate endpoint ourselves.
+    captured_media = []
+    original_extract_product_media = _ig_extractor.InstagramBaseIE._extract_product_media
+
+    def _capturing_extract_product_media(self, product_media):
+        captured_media.append(product_media)
+        return original_extract_product_media(self, product_media)
+
+    with _ig_capture_lock:
+        _ig_extractor.InstagramBaseIE._extract_product_media = _capturing_extract_product_media
+        try:
+            return run(captured_media)
+        finally:
+            _ig_extractor.InstagramBaseIE._extract_product_media = original_extract_product_media
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
