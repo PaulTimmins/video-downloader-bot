@@ -10,7 +10,7 @@ import uuid
 
 import yaml
 import yt_dlp
-from telegram import Message, Update
+from telegram import InputMediaPhoto, InputMediaVideo, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from yt_dlp.utils import sanitize_filename
@@ -35,6 +35,9 @@ MAX_PHOTO_BYTES = 10 * 1024 * 1024
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+
+# Telegram albums (sendMediaGroup) allow at most 10 items per call.
+MEDIA_GROUP_MAX = 10
 
 URL_RE = re.compile(r"https?://\S+")
 SUPPORTED_DOMAINS_RE = re.compile(
@@ -162,28 +165,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await status.edit_text(f"Nothing downloadable found at:\n{url}")
                 continue
 
-            sent_any = False
-            skipped = []
-            for i, path in enumerate(paths, start=1):
-                caption = url if len(paths) == 1 else f"{url} ({i}/{len(paths)})"
+            # Classify each downloaded file: photos/videos within Telegram's
+            # per-type size limits can go in one album (sendMediaGroup);
+            # anything else (oversized, or an unrecognized type) is sent as
+            # its own document reply instead, since albums can't mix in
+            # documents alongside photos/videos.
+            groupable = []  # (kind, path) for "photo" or "video"
+            singles = []  # paths sent individually as documents
+            skipped = []  # (label, size_or_None) that couldn't be sent
+
+            for path in paths:
                 ext = os.path.splitext(path)[1].lower()
                 size = os.path.getsize(path)
+                label = f"{url} ({os.path.basename(path)})" if len(paths) > 1 else url
 
+                if ext in IMAGE_EXTS and size <= MAX_PHOTO_BYTES:
+                    groupable.append(("photo", path))
+                elif ext in VIDEO_EXTS and size <= MAX_UPLOAD_BYTES:
+                    groupable.append(("video", path))
+                elif size <= MAX_UPLOAD_BYTES:
+                    singles.append((label, path))
+                else:
+                    skipped.append((label, size))
+
+            sent_any = False
+
+            if len(groupable) == 1:
+                kind, path = groupable[0]
                 try:
                     with open(path, "rb") as f:
-                        if ext in IMAGE_EXTS and size <= MAX_PHOTO_BYTES:
-                            await message.reply_photo(photo=f, caption=caption)
-                        elif ext in VIDEO_EXTS and size <= MAX_UPLOAD_BYTES:
-                            await message.reply_video(video=f, caption=caption)
-                        elif size <= MAX_UPLOAD_BYTES:
-                            await message.reply_document(document=f, caption=caption)
+                        if kind == "photo":
+                            await message.reply_photo(photo=f, caption=url)
                         else:
-                            skipped.append((caption, size))
-                            continue
+                            await message.reply_video(video=f, caption=url)
                     sent_any = True
                 except Exception as exc:  # noqa: BLE001
                     log.warning("upload failed for %s: %s", path, exc)
-                    skipped.append((caption, None))
+                    skipped.append((url, None))
+            elif groupable:
+                for start in range(0, len(groupable), MEDIA_GROUP_MAX):
+                    chunk = groupable[start : start + MEDIA_GROUP_MAX]
+                    files = [open(path, "rb") for _, path in chunk]
+                    try:
+                        media = [
+                            (InputMediaPhoto if kind == "photo" else InputMediaVideo)(
+                                media=f, caption=url if start == 0 and i == 0 else None
+                            )
+                            for i, ((kind, _), f) in enumerate(zip(chunk, files))
+                        ]
+                        await message.reply_media_group(media=media)
+                        sent_any = True
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("album send failed for %s: %s", url, exc)
+                        skipped.append((f"{url} (album)", None))
+                    finally:
+                        for f in files:
+                            f.close()
+
+            for label, path in singles:
+                try:
+                    with open(path, "rb") as f:
+                        await message.reply_document(document=f, caption=label)
+                    sent_any = True
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("upload failed for %s: %s", path, exc)
+                    skipped.append((label, None))
 
             if skipped:
                 lines = [
