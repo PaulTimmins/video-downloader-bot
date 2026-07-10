@@ -1,7 +1,12 @@
 # telegram-reel-bot
 
-Telegram bot that watches for Instagram/Facebook reel links in a chat,
-downloads them, and replies in the same chat with the video attached.
+Telegram bot that watches for supported links in a chat, downloads the
+media, and replies in the same chat with it attached:
+
+- Instagram reels, photo posts, and carousels ("sets" — sent as multiple
+  replies, one per item, each with its own filesize check)
+- Facebook reels/videos
+- YouTube videos and Shorts
 
 ## Setup
 
@@ -43,10 +48,14 @@ Don't commit it or share it.
 
 ## Limits
 
-- Telegram's Bot API caps file uploads from bots at 50MB. Larger reels will
-  download successfully but the bot will report that it can't attach them.
-  To lift this, you'd need to run your own [local Bot API
-  server](https://github.com/tdlib/telegram-bot-api) (up to 2000MB) and
+- Telegram's Bot API caps file uploads from bots at 50MB (10MB for
+  `sendPhoto`, though oversized images still go through as documents).
+  Larger videos will download successfully but the bot will report that it
+  can't attach them. To lift this, you'd need to run your own [local Bot
+  API server](https://github.com/tdlib/telegram-bot-api) (up to 2000MB) and
   point `python-telegram-bot` at it — not set up here.
 - Works in group chats too — the bot only replies to messages containing a
   supported link, and ignores everything else.
+- YouTube regularly changes how it blocks anonymous/automated downloads,
+  which breaks extraction until yt-dlp ships a fix. Run
+  `pip install -U yt-dlp` periodically (e.g. a weekly cron) to stay current.
