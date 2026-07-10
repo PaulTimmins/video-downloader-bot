@@ -1,14 +1,19 @@
+from __future__ import annotations
+
 import asyncio
 import logging
+import mimetypes
 import os
 import re
 import tempfile
+import uuid
 
 import yaml
 import yt_dlp
 from telegram import Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from yt_dlp.utils import sanitize_filename
 
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
@@ -47,22 +52,37 @@ def find_supported_urls(text: str) -> list[str]:
     return [u for u in URL_RE.findall(text) if SUPPORTED_DOMAINS_RE.search(u)]
 
 
-def _paths_from_info(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[str]:
-    """Resolve the downloaded file path(s) for a single-item result or a
-    carousel/playlist result (e.g. an Instagram "set" with multiple photos
-    and/or videos in one post)."""
-    items = list(info["entries"]) if info.get("entries") is not None else [info]
+def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[str]:
+    downloads = info.get("requested_downloads")
+    if downloads:
+        return [d["filepath"] for d in downloads if d.get("filepath")]
+    return [ydl.prepare_filename(info)]
 
-    paths = []
-    for item in items:
-        if not item:
-            continue
-        downloads = item.get("requested_downloads")
-        if downloads:
-            paths.extend(d["filepath"] for d in downloads if d.get("filepath"))
-        else:
-            paths.append(ydl.prepare_filename(item))
-    return paths
+
+def _download_image(ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str) -> str | None:
+    """Instagram's extractor only ever populates 'formats' for videos, so a
+    plain photo post (or a photo inside a carousel/"set") never has anything
+    yt-dlp's normal download pipeline will fetch. Grab the highest-res
+    thumbnail URL ourselves instead, reusing yt-dlp's own request handling
+    (cookies, headers, proxy) via ydl.urlopen."""
+    thumbnails = item.get("thumbnails") or []
+    if not thumbnails:
+        return None
+    best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+    img_url = best.get("url")
+    if not img_url:
+        return None
+
+    resp = ydl.urlopen(img_url)
+    content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    ext = mimetypes.guess_extension(content_type) or ".jpg"
+    if ext == ".jpe":
+        ext = ".jpg"
+    name = sanitize_filename(str(item.get("id") or uuid.uuid4().hex), restricted=True)
+    path = os.path.join(dest_dir, f"{name}{ext}")
+    with open(path, "wb") as f:
+        f.write(resp.read())
+    return path
 
 
 def download_media(url: str, dest_dir: str) -> list[str]:
@@ -86,8 +106,31 @@ def download_media(url: str, dest_dir: str) -> list[str]:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return _paths_from_info(ydl, info)
+        # process=False skips yt-dlp's format-selection/download pipeline
+        # entirely, so a photo-only item (no video formats) doesn't hard-fail
+        # extraction before we even get to see the rest of the post/carousel.
+        raw = ydl.extract_info(url, download=False, process=False)
+        items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
+
+        paths = []
+        for item in items:
+            if not item:
+                continue
+            try:
+                if item.get("formats") or item.get("url"):
+                    # Carry over fields normally set on the outer result so
+                    # process_ie_result has what it needs for a bare entry.
+                    for key in ("extractor", "extractor_key", "webpage_url"):
+                        item.setdefault(key, raw.get(key))
+                    processed = ydl.process_ie_result(item, download=True)
+                    paths.extend(_paths_from_processed(ydl, processed))
+                else:
+                    path = _download_image(ydl, item, dest_dir)
+                    if path:
+                        paths.append(path)
+            except Exception as exc:  # noqa: BLE001 - one bad carousel item shouldn't sink the rest
+                log.warning("skipping one item of %s: %s", url, exc)
+        return paths
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
