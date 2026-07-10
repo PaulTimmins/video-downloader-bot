@@ -54,6 +54,9 @@ _ig_capture_lock = threading.Lock()
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
+# httpx logs the full request URL at INFO level, which for Telegram's Bot API
+# means "https://api.telegram.org/bot<TOKEN>/...' - i.e. the bot token itself.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("reel-bot")
 
 
