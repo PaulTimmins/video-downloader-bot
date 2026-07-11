@@ -112,9 +112,13 @@ def download_media(url: str, dest_dir: str) -> list[str]:
     outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": (
-            f"best[filesize<{MAX_UPLOAD_BYTES}]/best[height<=720]/best[height<=480]/best"
-        ),
+        # Only steer toward a smaller format when a platform actually reports
+        # filesize (mainly YouTube); otherwise just take the real best
+        # format. A height cap here would silently kick in on every
+        # Instagram/Facebook/TikTok link (they rarely report filesize),
+        # sometimes landing on a differently-cropped or audio-less
+        # alternate rendition instead of the primary one.
+        "format": f"best[filesize<={MAX_UPLOAD_BYTES}]/best",
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
