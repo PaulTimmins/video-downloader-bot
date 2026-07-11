@@ -7,6 +7,7 @@ media, and replies in the same chat with it attached:
   replies, one per item, each with its own filesize check)
 - Facebook reels/videos
 - YouTube videos and Shorts
+- TikTok videos (anonymous, no login needed)
 
 ## Setup
 
@@ -59,3 +60,7 @@ Don't commit it or share it.
 - YouTube regularly changes how it blocks anonymous/automated downloads,
   which breaks extraction until yt-dlp ships a fix. Run
   `pip install -U yt-dlp` periodically (e.g. a weekly cron) to stay current.
+- TikTok "photo mode" posts (multi-image slideshows with music, as opposed
+  to a normal video) aren't fully supported yet — yt-dlp doesn't expose the
+  actual slide images for these, only the background audio or a single
+  cover thumbnail. Regular TikTok videos are unaffected.

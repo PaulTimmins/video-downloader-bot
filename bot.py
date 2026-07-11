@@ -43,7 +43,7 @@ MEDIA_GROUP_MAX = 10
 
 URL_RE = re.compile(r"https?://\S+")
 SUPPORTED_DOMAINS_RE = re.compile(
-    r"(instagram\.com|facebook\.com|fb\.watch|youtube\.com|youtu\.be)",
+    r"(instagram\.com|facebook\.com|fb\.watch|youtube\.com|youtu\.be|tiktok\.com)",
     re.IGNORECASE,
 )
 
@@ -298,7 +298,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send me a link and I'll reply with the media:\n"
         "- Instagram reels, photo posts, and carousels (\"sets\")\n"
         "- Facebook reels/videos\n"
-        "- YouTube videos and Shorts"
+        "- YouTube videos and Shorts\n"
+        "- TikTok videos"
     )
 
 
