@@ -164,7 +164,7 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
             # hard-fail extraction before we see the rest of the post.
             try:
                 raw = ydl.extract_info(url, download=False, process=False)
-            except yt_dlp.utils.ExtractorError as exc:
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
                 # A single (non-carousel) photo post: yt-dlp's primary
                 # extractor refuses these outright, without even trying to
                 # fetch the image - but the GraphQL call it just made to
