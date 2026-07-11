@@ -157,7 +157,7 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    def run(captured_media: list[dict], captured_photo_candidates: list[dict]) -> list[dict]:
+    def run(captured_media: list[dict]) -> list[dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # process=False skips yt-dlp's format-selection/download pipeline
             # entirely, so a photo-only item (no video formats) doesn't
@@ -165,14 +165,13 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
             try:
                 raw = ydl.extract_info(url, download=False, process=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
-                # A single (non-carousel) photo post: yt-dlp's primary
-                # extractor refuses these outright, without even trying to
-                # fetch the image - but the GraphQL call it just made to
-                # reach that point already returned the post's real
-                # display_resources, captured via the monkeypatch below.
-                if "no video in this post" in str(exc).lower() and captured_photo_candidates:
-                    raw_media = {"image_versions2": {"candidates": captured_photo_candidates}}
-                    entry = _download_image(ydl, {}, dest_dir, raw_media)
+                # A single (non-carousel) photo post: yt-dlp calls
+                # _extract_product_media (captured below) same as for a
+                # carousel entry, but then raises outright afterward since
+                # there's no video format - discarding its own result before
+                # we ever see it. The monkeypatch already has what it built.
+                if "no video in this post" in str(exc).lower() and captured_media:
+                    entry = _download_image(ydl, {}, dest_dir, captured_media[-1])
                     return [entry] if entry else []
                 raise
             items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
@@ -200,53 +199,28 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
             return downloaded
 
     if "instagram.com" not in url.lower():
-        return run([], [])
+        return run([])
 
-    # yt-dlp's Instagram extractor throws away each photo's real image data
-    # before returning its result to us - it only preserves resolution data
-    # for videos, which is why photo items came through as tiny square crops
-    # (or, for a single photo post, an outright "no video" failure).
-    # Intercept the raw API/GraphQL data right where the extractor itself
-    # fetches it (same requests, same cookies/session already proven to
-    # work) before it gets discarded, instead of guessing at separate
-    # endpoints ourselves.
+    # yt-dlp's Instagram extractor calls _extract_product_media for every
+    # item - carousel entries and single-photo posts alike - but for a photo
+    # with no video formats it raises right afterward without ever handing
+    # us the result, discarding the (perfectly good) image data it just
+    # built. Intercept the raw product_media dict right where the extractor
+    # builds it (same request, same cookies/session already proven to work)
+    # before it gets lost, instead of guessing at separate endpoints.
     captured_media = []
-    captured_photo_candidates = []
     original_extract_product_media = _ig_extractor.InstagramBaseIE._extract_product_media
-    original_download_json = _ig_extractor.InstagramIE._download_json
 
     def _capturing_extract_product_media(self, product_media):
         captured_media.append(product_media)
         return original_extract_product_media(self, product_media)
 
-    def _capturing_download_json(self, url_or_request, *args, **kwargs):
-        result = original_download_json(self, url_or_request, *args, **kwargs)
-        try:
-            req_url = url_or_request if isinstance(url_or_request, str) else getattr(url_or_request, "url", "")
-            log.info("instagram _download_json called: url=%s got_result=%s", req_url, result is not None)
-            if "graphql/query" in (req_url or ""):
-                media = ((result or {}).get("data") or {}).get("xdt_shortcode_media") or {}
-                log.info(
-                    "instagram graphql query result: got_media=%s keys=%s has_display_resources=%s",
-                    bool(media), sorted(media.keys()) if media else None, bool(media.get("display_resources")),
-                )
-                for r in media.get("display_resources") or []:
-                    if r.get("src"):
-                        captured_photo_candidates.append({
-                            "url": r["src"], "width": r.get("config_width"), "height": r.get("config_height"),
-                        })
-        except Exception as exc:  # noqa: BLE001 - capture is best-effort, must never break real extraction
-            log.warning("instagram capture logic errored: %s", exc)
-        return result
-
     with _ig_capture_lock:
         _ig_extractor.InstagramBaseIE._extract_product_media = _capturing_extract_product_media
-        _ig_extractor.InstagramIE._download_json = _capturing_download_json
         try:
-            return run(captured_media, captured_photo_candidates)
+            return run(captured_media)
         finally:
             _ig_extractor.InstagramBaseIE._extract_product_media = original_extract_product_media
-            _ig_extractor.InstagramIE._download_json = original_download_json
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
