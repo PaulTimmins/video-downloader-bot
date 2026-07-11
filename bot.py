@@ -64,29 +64,47 @@ def find_supported_urls(text: str) -> list[str]:
     return [u for u in URL_RE.findall(text) if SUPPORTED_DOMAINS_RE.search(u)]
 
 
-def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[str]:
+def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[dict]:
+    """Telegram renders a video with a wrong (often square) preview box
+    unless width/height are passed explicitly with the upload, since it
+    can't always probe them itself - so carry yt-dlp's own metadata through
+    alongside each file path instead of just returning bare paths."""
     downloads = info.get("requested_downloads")
     if downloads:
-        return [d["filepath"] for d in downloads if d.get("filepath")]
-    return [ydl.prepare_filename(info)]
+        return [
+            {
+                "path": d["filepath"],
+                "width": d.get("width") or info.get("width"),
+                "height": d.get("height") or info.get("height"),
+                "duration": info.get("duration"),
+            }
+            for d in downloads
+            if d.get("filepath")
+        ]
+    return [{
+        "path": ydl.prepare_filename(info),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "duration": info.get("duration"),
+    }]
 
 
-def _best_candidate_url(candidates: list[dict]) -> str | None:
+def _best_candidate(candidates: list[dict]) -> dict | None:
     if not candidates:
         return None
-    best = max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
-    return best.get("url")
+    return max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
 
 
 def _download_image(
     ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str, raw_media: dict | None = None
-) -> str | None:
+) -> dict | None:
     """Fetch the full-resolution photo for an item that has no video
     formats. Prefers the raw Instagram media-info candidates (real
     resolution); falls back to whatever yt-dlp's own (often low-res or
     absent) 'thumbnails' list has if that lookup wasn't available."""
     candidates = ((raw_media or {}).get("image_versions2") or {}).get("candidates") or []
-    img_url = _best_candidate_url(candidates) or _best_candidate_url(item.get("thumbnails") or [])
+    best = _best_candidate(candidates) or _best_candidate(item.get("thumbnails") or [])
+    img_url = (best or {}).get("url")
     if not img_url:
         return None
 
@@ -105,10 +123,10 @@ def _download_image(
     path = os.path.join(dest_dir, f"{name}{ext}")
     with open(path, "wb") as f:
         f.write(resp.read())
-    return path
+    return {"path": path, "width": best.get("width"), "height": best.get("height"), "duration": None}
 
 
-def download_media(url: str, dest_dir: str) -> list[str]:
+def download_media(url: str, dest_dir: str) -> list[dict]:
     outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -139,7 +157,7 @@ def download_media(url: str, dest_dir: str) -> list[str]:
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    def run(captured_media: list[dict]) -> list[str]:
+    def run(captured_media: list[dict]) -> list[dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # process=False skips yt-dlp's format-selection/download pipeline
             # entirely, so a photo-only item (no video formats) doesn't
@@ -147,7 +165,7 @@ def download_media(url: str, dest_dir: str) -> list[str]:
             raw = ydl.extract_info(url, download=False, process=False)
             items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
 
-            paths = []
+            downloaded = []
             for i, item in enumerate(items):
                 if not item:
                     continue
@@ -159,15 +177,15 @@ def download_media(url: str, dest_dir: str) -> list[str]:
                         for key in ("extractor", "extractor_key", "webpage_url"):
                             item.setdefault(key, raw.get(key))
                         processed = ydl.process_ie_result(item, download=True)
-                        paths.extend(_paths_from_processed(ydl, processed))
+                        downloaded.extend(_paths_from_processed(ydl, processed))
                     else:
                         raw_media = captured_media[i] if i < len(captured_media) else None
-                        path = _download_image(ydl, item, dest_dir, raw_media)
-                        if path:
-                            paths.append(path)
+                        entry = _download_image(ydl, item, dest_dir, raw_media)
+                        if entry:
+                            downloaded.append(entry)
                 except Exception as exc:  # noqa: BLE001 - one bad carousel item shouldn't sink the rest
                     log.warning("skipping one item of %s: %s", url, exc)
-            return paths
+            return downloaded
 
     if "instagram.com" not in url.lower():
         return run([])
@@ -211,7 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         with tempfile.TemporaryDirectory(prefix="reel-", dir=TEMP_DIR) as tmp_dir:
             try:
-                paths = await asyncio.to_thread(download_media, url, tmp_dir)
+                downloaded = await asyncio.to_thread(download_media, url, tmp_dir)
             except Exception as exc:  # noqa: BLE001 - surface any download failure to the user
                 log.warning("download failed for %s: %s", url, exc)
                 await status.edit_text(
@@ -219,7 +237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 continue
 
-            if not paths:
+            if not downloaded:
                 await status.edit_text(f"Nothing downloadable found at:\n{url}")
                 continue
 
@@ -228,19 +246,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # anything else (oversized, or an unrecognized type) is sent as
             # its own document reply instead, since albums can't mix in
             # documents alongside photos/videos.
-            groupable = []  # (kind, path) for "photo" or "video"
-            singles = []  # paths sent individually as documents
+            groupable = []  # (kind, entry) for "photo" or "video"
+            singles = []  # (label, path) sent individually as documents
             skipped = []  # (label, size_or_None) that couldn't be sent
 
-            for path in paths:
+            for entry in downloaded:
+                path = entry["path"]
                 ext = os.path.splitext(path)[1].lower()
                 size = os.path.getsize(path)
-                label = f"{url} ({os.path.basename(path)})" if len(paths) > 1 else url
+                label = f"{url} ({os.path.basename(path)})" if len(downloaded) > 1 else url
 
                 if ext in IMAGE_EXTS and size <= MAX_PHOTO_BYTES:
-                    groupable.append(("photo", path))
+                    groupable.append(("photo", entry))
                 elif ext in VIDEO_EXTS and size <= MAX_UPLOAD_BYTES:
-                    groupable.append(("video", path))
+                    groupable.append(("video", entry))
                 elif size <= MAX_UPLOAD_BYTES:
                     singles.append((label, path))
                 else:
@@ -249,13 +268,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sent_any = False
 
             if len(groupable) == 1:
-                kind, path = groupable[0]
+                kind, entry = groupable[0]
+                path = entry["path"]
                 try:
                     with open(path, "rb") as f:
                         if kind == "photo":
                             await message.reply_photo(photo=f, caption=url)
                         else:
-                            await message.reply_video(video=f, caption=url)
+                            await message.reply_video(
+                                video=f,
+                                caption=url,
+                                width=entry.get("width"),
+                                height=entry.get("height"),
+                                duration=entry.get("duration"),
+                                supports_streaming=True,
+                            )
                     sent_any = True
                 except Exception as exc:  # noqa: BLE001
                     log.warning("upload failed for %s: %s", path, exc)
@@ -263,13 +290,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             elif groupable:
                 for start in range(0, len(groupable), MEDIA_GROUP_MAX):
                     chunk = groupable[start : start + MEDIA_GROUP_MAX]
-                    files = [open(path, "rb") for _, path in chunk]
+                    files = [open(entry["path"], "rb") for _, entry in chunk]
                     try:
                         media = [
-                            (InputMediaPhoto if kind == "photo" else InputMediaVideo)(
-                                media=f, caption=url if start == 0 and i == 0 else None
-                            )
-                            for i, ((kind, _), f) in enumerate(zip(chunk, files))
+                            (InputMediaPhoto(media=f, caption=url if start == 0 and i == 0 else None)
+                             if kind == "photo" else
+                             InputMediaVideo(
+                                 media=f,
+                                 caption=url if start == 0 and i == 0 else None,
+                                 width=entry.get("width"),
+                                 height=entry.get("height"),
+                                 duration=entry.get("duration"),
+                                 supports_streaming=True,
+                             ))
+                            for i, ((kind, entry), f) in enumerate(zip(chunk, files))
                         ]
                         await message.reply_media_group(media=media)
                         sent_any = True
