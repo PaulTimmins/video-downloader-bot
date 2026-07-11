@@ -222,15 +222,21 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
     def _capturing_download_json(self, url_or_request, *args, **kwargs):
         result = original_download_json(self, url_or_request, *args, **kwargs)
         try:
-            if isinstance(url_or_request, str) and "graphql/query" in url_or_request:
+            req_url = url_or_request if isinstance(url_or_request, str) else getattr(url_or_request, "url", "")
+            log.info("instagram _download_json called: url=%s got_result=%s", req_url, result is not None)
+            if "graphql/query" in (req_url or ""):
                 media = ((result or {}).get("data") or {}).get("xdt_shortcode_media") or {}
+                log.info(
+                    "instagram graphql query result: got_media=%s keys=%s has_display_resources=%s",
+                    bool(media), sorted(media.keys()) if media else None, bool(media.get("display_resources")),
+                )
                 for r in media.get("display_resources") or []:
                     if r.get("src"):
                         captured_photo_candidates.append({
                             "url": r["src"], "width": r.get("config_width"), "height": r.get("config_height"),
                         })
-        except Exception:  # noqa: BLE001 - capture is best-effort, must never break real extraction
-            pass
+        except Exception as exc:  # noqa: BLE001 - capture is best-effort, must never break real extraction
+            log.warning("instagram capture logic errored: %s", exc)
         return result
 
     with _ig_capture_lock:
