@@ -8,6 +8,8 @@ media, and replies in the same chat with it attached:
 - Facebook reels/videos
 - YouTube videos and Shorts
 - TikTok videos (anonymous, no login needed)
+- Twitter/X photos and videos (including multi-photo tweets)
+- Bluesky photos and videos (anonymous, no login needed)
 
 ## Setup
 

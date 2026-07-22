@@ -11,11 +11,13 @@ import uuid
 
 import yaml
 import yt_dlp
+import yt_dlp.extractor.bluesky as _bsky_extractor
 import yt_dlp.extractor.instagram as _ig_extractor
+import yt_dlp.extractor.twitter as _tw_extractor
 from telegram import InputMediaPhoto, InputMediaVideo, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
-from yt_dlp.utils import sanitize_filename
+from yt_dlp.utils import sanitize_filename, update_url_query
 
 CONFIG_PATH = os.environ.get(
     "CONFIG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
@@ -43,13 +45,14 @@ MEDIA_GROUP_MAX = 10
 
 URL_RE = re.compile(r"https?://\S+")
 SUPPORTED_DOMAINS_RE = re.compile(
-    r"(instagram\.com|facebook\.com|fb\.watch|youtube\.com|youtu\.be|tiktok\.com)",
+    r"\b(?:instagram\.com|facebook\.com|fb\.watch|youtube\.com|youtu\.be|tiktok\.com"
+    r"|twitter\.com|x\.com|bsky\.app)\b",
     re.IGNORECASE,
 )
 
-# Guards the monkeypatch below so concurrent Instagram downloads (across
-# different chats) can't race on the same patched method.
-_ig_capture_lock = threading.Lock()
+# Guards the monkeypatches below so concurrent downloads (across different
+# chats) can't race on the same patched method.
+_capture_lock = threading.Lock()
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -95,35 +98,88 @@ def _best_candidate(candidates: list[dict]) -> dict | None:
     return max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
 
 
-def _download_image(
-    ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str, raw_media: dict | None = None
+def _fetch_and_save_image(
+    ydl: "yt_dlp.YoutubeDL",
+    img_url: str | None,
+    dest_dir: str,
+    name_hint: str,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict | None:
-    """Fetch the full-resolution photo for an item that has no video
-    formats. Prefers the raw Instagram media-info candidates (real
-    resolution); falls back to whatever yt-dlp's own (often low-res or
-    absent) 'thumbnails' list has if that lookup wasn't available."""
-    candidates = ((raw_media or {}).get("image_versions2") or {}).get("candidates") or []
-    best = _best_candidate(candidates) or _best_candidate(item.get("thumbnails") or [])
-    img_url = (best or {}).get("url")
     if not img_url:
         return None
-
     resp = ydl.urlopen(img_url)
     content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
     ext = mimetypes.guess_extension(content_type) or ".jpg"
     if ext == ".jpe":
         ext = ".jpg"
+    name = sanitize_filename(str(name_hint), restricted=True)
+    path = os.path.join(dest_dir, f"{name}{ext}")
+    with open(path, "wb") as f:
+        f.write(resp.read())
+    return {"path": path, "width": width, "height": height, "duration": None}
+
+
+def _download_image(
+    ydl: "yt_dlp.YoutubeDL", item: dict, dest_dir: str, raw_media: dict | None = None
+) -> dict | None:
+    """Fetch the full-resolution photo for an Instagram item with no video
+    formats, using the raw product_media captured via monkeypatch (real
+    image_versions2 resolution data yt-dlp itself discards for photos).
+    Deliberately does NOT fall back to yt-dlp's generic 'thumbnails' field -
+    on other platforms (confirmed on Twitter) that can hold low-res
+    card/link-preview art on an unrelated entry, not real post content."""
+    candidates = ((raw_media or {}).get("image_versions2") or {}).get("candidates") or []
+    best = _best_candidate(candidates)
+    if not best:
+        return None
     raw_id = (
         (raw_media or {}).get("code")
         or (raw_media or {}).get("pk")
         or item.get("id")
         or uuid.uuid4().hex
     )
-    name = sanitize_filename(str(raw_id), restricted=True)
-    path = os.path.join(dest_dir, f"{name}{ext}")
-    with open(path, "wb") as f:
-        f.write(resp.read())
-    return {"path": path, "width": best.get("width"), "height": best.get("height"), "duration": None}
+    return _fetch_and_save_image(ydl, best.get("url"), dest_dir, raw_id, best.get("width"), best.get("height"))
+
+
+def _twitter_photo_candidates(status: dict) -> list[dict]:
+    """Real per-image entries from a tweet (and its quoted tweet, if any).
+    yt-dlp's Twitter extractor filters photo-type media out of
+    extended_entities entirely - it only ever builds entries for
+    video/gif - so these never reach us any other way."""
+    out = []
+    for root in (status, status.get("quoted_status") or {}):
+        for media in (root.get("extended_entities") or {}).get("media") or []:
+            if media.get("type") != "photo":
+                continue
+            media_url = media.get("media_url_https") or media.get("media_url")
+            if not media_url:
+                continue
+            orig = media.get("original_info") or {}
+            out.append({
+                "url": update_url_query(media_url, {"name": "orig"}),
+                "width": orig.get("width"),
+                "height": orig.get("height"),
+                "id": media.get("id_str") or media.get("id"),
+            })
+    return out
+
+
+def _bluesky_photo_candidates(post: dict) -> list[dict]:
+    """Real per-image entries from a Bluesky post (and recordWithMedia
+    quote posts). yt-dlp's Bluesky extractor only ever builds entries for
+    app.bsky.embed.video/external - there's no image-embed handling at
+    all, so these never reach us any other way."""
+    out = []
+    for embed in (post.get("embed"), (post.get("embed") or {}).get("media")):
+        if not embed or embed.get("$type") != "app.bsky.embed.images#view":
+            continue
+        for img in embed.get("images") or []:
+            if not img.get("fullsize"):
+                continue
+            ar = img.get("aspectRatio") or {}
+            out.append({"url": img["fullsize"], "width": ar.get("width"), "height": ar.get("height")})
+    return out
 
 
 def download_media(url: str, dest_dir: str) -> list[dict]:
@@ -157,7 +213,7 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    def run(captured_media: list[dict]) -> list[dict]:
+    def run(captured_media: list[dict], on_no_video=None) -> list[dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # process=False skips yt-dlp's format-selection/download pipeline
             # entirely, so a photo-only item (no video formats) doesn't
@@ -165,14 +221,15 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
             try:
                 raw = ydl.extract_info(url, download=False, process=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
-                # A single (non-carousel) photo post: yt-dlp calls
-                # _extract_product_media (captured below) same as for a
-                # carousel entry, but then raises outright afterward since
-                # there's no video format - discarding its own result before
-                # we ever see it. The monkeypatch already has what it built.
-                if "no video in this post" in str(exc).lower() and captured_media:
-                    entry = _download_image(ydl, {}, dest_dir, captured_media[-1])
-                    return [entry] if entry else []
+                # A photo-only post: several extractors (Instagram single
+                # posts, Twitter/X photo tweets, Bluesky image posts) raise
+                # outright instead of returning the image data they already
+                # fetched. The relevant monkeypatch below already captured
+                # it; use that instead of giving up.
+                if on_no_video:
+                    result = on_no_video(ydl, exc)
+                    if result is not None:
+                        return result
                 raise
             items = list(raw["entries"]) if raw.get("entries") is not None else [raw]
 
@@ -198,29 +255,117 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
                     log.warning("skipping one item of %s: %s", url, exc)
             return downloaded
 
-    if "instagram.com" not in url.lower():
-        return run([])
+    if re.search(r"\binstagram\.com\b", url, re.IGNORECASE):
+        # yt-dlp's Instagram extractor calls _extract_product_media for
+        # every item - carousel entries and single-photo posts alike - but
+        # for a photo with no video formats it raises right afterward
+        # without ever handing us the result, discarding the (perfectly
+        # good) image data it just built. Intercept the raw product_media
+        # dict right where the extractor builds it (same request, same
+        # cookies/session already proven to work) before it gets lost,
+        # instead of guessing at separate endpoints.
+        captured_media = []
+        original = _ig_extractor.InstagramBaseIE._extract_product_media
 
-    # yt-dlp's Instagram extractor calls _extract_product_media for every
-    # item - carousel entries and single-photo posts alike - but for a photo
-    # with no video formats it raises right afterward without ever handing
-    # us the result, discarding the (perfectly good) image data it just
-    # built. Intercept the raw product_media dict right where the extractor
-    # builds it (same request, same cookies/session already proven to work)
-    # before it gets lost, instead of guessing at separate endpoints.
-    captured_media = []
-    original_extract_product_media = _ig_extractor.InstagramBaseIE._extract_product_media
+        def _capturing_extract_product_media(self, product_media):
+            captured_media.append(product_media)
+            return original(self, product_media)
 
-    def _capturing_extract_product_media(self, product_media):
-        captured_media.append(product_media)
-        return original_extract_product_media(self, product_media)
+        def on_no_video(ydl, exc):
+            if "no video in this post" not in str(exc).lower() or not captured_media:
+                return None
+            entry = _download_image(ydl, {}, dest_dir, captured_media[-1])
+            # None here means we genuinely found no usable image data (not
+            # just "downloaded zero images") - let the original, more
+            # informative yt-dlp error propagate instead of masking it with
+            # a generic "nothing downloadable" message.
+            return [entry] if entry else None
 
-    with _ig_capture_lock:
-        _ig_extractor.InstagramBaseIE._extract_product_media = _capturing_extract_product_media
-        try:
-            return run(captured_media)
-        finally:
-            _ig_extractor.InstagramBaseIE._extract_product_media = original_extract_product_media
+        with _capture_lock:
+            _ig_extractor.InstagramBaseIE._extract_product_media = _capturing_extract_product_media
+            try:
+                return run(captured_media, on_no_video)
+            finally:
+                _ig_extractor.InstagramBaseIE._extract_product_media = original
+
+    if re.search(r"\b(?:twitter\.com|x\.com)\b", url, re.IGNORECASE):
+        # yt-dlp's Twitter extractor filters photo-type media out of a
+        # tweet's extended_entities entirely (it only builds entries for
+        # video/gif), so a photo-only tweet raises "No video could be
+        # found" without ever exposing the image URLs it already has.
+        # Intercept the raw tweet data at _extract_status, the exact point
+        # it's fetched, and pull the real photo entries out ourselves.
+        captured_status = []
+        original = _tw_extractor.TwitterIE._extract_status
+
+        def _capturing_extract_status(self, twid):
+            status = original(self, twid)
+            captured_status.append(status)
+            return status
+
+        def on_no_video(ydl, exc):
+            if "no video could be found" not in str(exc).lower() or not captured_status:
+                return None
+            candidates = _twitter_photo_candidates(captured_status[-1])
+            if not candidates:
+                # No real photo data either - not a photo-only tweet, just a
+                # genuine failure (suspended, deleted, etc). Let the
+                # original error propagate instead of masking it.
+                return None
+            downloaded = []
+            for i, c in enumerate(candidates):
+                entry = _fetch_and_save_image(
+                    ydl, c["url"], dest_dir, c.get("id") or f"photo{i}", c.get("width"), c.get("height"),
+                )
+                if entry:
+                    downloaded.append(entry)
+            return downloaded
+
+        with _capture_lock:
+            _tw_extractor.TwitterIE._extract_status = _capturing_extract_status
+            try:
+                return run([], on_no_video)
+            finally:
+                _tw_extractor.TwitterIE._extract_status = original
+
+    if re.search(r"\bbsky\.app\b", url, re.IGNORECASE):
+        # Same situation again: yt-dlp's Bluesky extractor only ever builds
+        # entries for video/external-link embeds - there's no image-embed
+        # handling at all, so a photo-only post raises "No video could be
+        # found" despite the (public, unauthenticated) API response it just
+        # got already containing the real image URLs.
+        captured_post = []
+        original = _bsky_extractor.BlueskyIE._extract_post
+
+        def _capturing_extract_post(self, handle, post_id):
+            post = original(self, handle, post_id)
+            captured_post.append(post)
+            return post
+
+        def on_no_video(ydl, exc):
+            if "no video could be found" not in str(exc).lower() or not captured_post:
+                return None
+            candidates = _bluesky_photo_candidates(captured_post[-1])
+            if not candidates:
+                # No real photo data either - not an image-only post, just a
+                # genuine failure. Let the original error propagate instead
+                # of masking it.
+                return None
+            downloaded = []
+            for i, c in enumerate(candidates):
+                entry = _fetch_and_save_image(ydl, c["url"], dest_dir, f"photo{i}", c.get("width"), c.get("height"))
+                if entry:
+                    downloaded.append(entry)
+            return downloaded
+
+        with _capture_lock:
+            _bsky_extractor.BlueskyIE._extract_post = _capturing_extract_post
+            try:
+                return run([], on_no_video)
+            finally:
+                _bsky_extractor.BlueskyIE._extract_post = original
+
+    return run([])
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -355,7 +500,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- Instagram reels, photo posts, and carousels (\"sets\")\n"
         "- Facebook reels/videos\n"
         "- YouTube videos and Shorts\n"
-        "- TikTok videos"
+        "- TikTok videos\n"
+        "- Twitter/X photos and videos\n"
+        "- Bluesky photos and videos"
     )
 
 
