@@ -394,7 +394,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 continue
 
             if not downloaded:
-                await status.edit_text(f"Nothing downloadable found at:\n{url}")
+                log.info("nothing downloadable found at %s", url)
+                await status.delete()
                 continue
 
             # Classify each downloaded file: photos/videos within Telegram's
