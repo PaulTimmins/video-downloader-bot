@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -16,7 +17,13 @@ import yt_dlp.extractor.instagram as _ig_extractor
 import yt_dlp.extractor.twitter as _tw_extractor
 from telegram import InputMediaPhoto, InputMediaVideo, Message, Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from yt_dlp.utils import sanitize_filename, update_url_query
 
 CONFIG_PATH = os.environ.get(
@@ -31,6 +38,12 @@ COOKIES_FILE = _config.get("cookies_file") or None
 TEMP_DIR = _config.get("temp_dir") or None
 if TEMP_DIR:
     os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Persists per-chat preferences (currently just the reply-to-sender toggle)
+# across restarts. JSON keyed by chat id.
+SETTINGS_FILE = _config.get("settings_file") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "chat_settings.json"
+)
 
 # Telegram's Bot API caps file uploads from bots at 50MB, and photos sent
 # via sendPhoto at 10MB (oversized images still go through as documents).
@@ -61,6 +74,37 @@ logging.basicConfig(
 # means "https://api.telegram.org/bot<TOKEN>/...' - i.e. the bot token itself.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("reel-bot")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            return json.load(f) or {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+# In-memory settings, mutated only from the (single-threaded) asyncio event
+# loop, so no lock is needed. Written through to disk on every change.
+_SETTINGS = _load_settings()
+
+
+def _save_settings() -> None:
+    tmp = f"{SETTINGS_FILE}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(_SETTINGS, f)
+    os.replace(tmp, SETTINGS_FILE)  # atomic, so a crash mid-write can't corrupt it
+
+
+def chat_replies_enabled(chat_id: int) -> bool:
+    """Whether the bot should reply to (and thus notify) the original poster.
+    Defaults to True for chats that haven't set a preference."""
+    return _SETTINGS.get(str(chat_id), {}).get("reply", True)
+
+
+def set_chat_replies(chat_id: int, enabled: bool) -> None:
+    _SETTINGS.setdefault(str(chat_id), {})["reply"] = enabled
+    _save_settings()
 
 
 def find_supported_urls(text: str) -> list[str]:
@@ -377,11 +421,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not urls:
         return
 
+    # When replies are disabled for this chat, everything is sent as a plain
+    # message (do_quote=False) instead of a reply to the poster's message, so
+    # the poster isn't notified. Default (True) keeps the original behavior.
+    quote = chat_replies_enabled(message.chat_id)
+
     for url in urls:
         await context.bot.send_chat_action(
             chat_id=message.chat_id, action=ChatAction.UPLOAD_VIDEO
         )
-        status = await message.reply_text(f"Downloading…\n{url}")
+        status = await message.reply_text(f"Downloading…\n{url}", do_quote=quote)
 
         with tempfile.TemporaryDirectory(prefix="reel-", dir=TEMP_DIR) as tmp_dir:
             try:
@@ -430,7 +479,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 try:
                     with open(path, "rb") as f:
                         if kind == "photo":
-                            await message.reply_photo(photo=f, caption=url)
+                            await message.reply_photo(photo=f, caption=url, do_quote=quote)
                         else:
                             await message.reply_video(
                                 video=f,
@@ -439,6 +488,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 height=entry.get("height"),
                                 duration=entry.get("duration"),
                                 supports_streaming=True,
+                                do_quote=quote,
                             )
                     sent_any = True
                 except Exception as exc:  # noqa: BLE001
@@ -462,7 +512,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                              ))
                             for i, ((kind, entry), f) in enumerate(zip(chunk, files))
                         ]
-                        await message.reply_media_group(media=media)
+                        await message.reply_media_group(media=media, do_quote=quote)
                         sent_any = True
                     except Exception as exc:  # noqa: BLE001
                         log.warning("album send failed for %s: %s", url, exc)
@@ -474,7 +524,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for label, path in singles:
                 try:
                     with open(path, "rb") as f:
-                        await message.reply_document(document=f, caption=label)
+                        await message.reply_document(document=f, caption=label, do_quote=quote)
                     sent_any = True
                 except Exception as exc:  # noqa: BLE001
                     log.warning("upload failed for %s: %s", path, exc)
@@ -488,7 +538,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 note = "Couldn't send:\n" + "\n".join(lines)
                 if sent_any:
                     await status.delete()
-                    await message.reply_text(note)
+                    await message.reply_text(note, do_quote=quote)
                 else:
                     await status.edit_text(note)
             else:
@@ -503,13 +553,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- YouTube videos and Shorts\n"
         "- TikTok videos\n"
         "- Twitter/X photos and videos\n"
-        "- Bluesky photos and videos"
+        "- Bluesky photos and videos\n\n"
+        "By default I reply to the message with the link (which notifies the "
+        "sender). Use /replies off if you'd rather I just post the media "
+        "without replying. /replies shows the current setting."
+    )
+
+
+async def replies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    arg = (context.args[0].lower() if context.args else "")
+
+    if arg in ("on", "off"):
+        set_chat_replies(message.chat_id, arg == "on")
+        if arg == "on":
+            await message.reply_text(
+                "Replies on — I'll reply to the message with the link (notifying the sender)."
+            )
+        else:
+            await message.reply_text(
+                "Replies off — I'll post media without replying to the original message."
+            )
+        return
+
+    state = "on" if chat_replies_enabled(message.chat_id) else "off"
+    await message.reply_text(
+        f"Replies are currently {state}.\n"
+        "Use /replies on or /replies off to change it."
     )
 
 
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.COMMAND & filters.Regex("^/start"), start))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("replies", replies_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info(
         "bot starting (cookies=%s, temp_dir=%s)",
