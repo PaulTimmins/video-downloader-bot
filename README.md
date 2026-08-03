@@ -18,6 +18,12 @@ a caption), since link previews often show only a truncated portion.
 Download failures aren't posted to the chat — they're logged server-side
 only, so a bad or unreachable link doesn't clutter the conversation.
 
+Video dimensions are read from the downloaded file with `ffprobe` (part of
+ffmpeg) so vertical/phone videos keep their correct aspect ratio in
+Telegram rather than showing up near-square. If `ffprobe` isn't installed
+it falls back to yt-dlp's (sometimes missing) metadata — install ffmpeg
+for best results.
+
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram

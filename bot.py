@@ -6,6 +6,8 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -117,29 +119,81 @@ def find_supported_urls(text: str) -> list[str]:
     return [u for u in URL_RE.findall(text) if SUPPORTED_DOMAINS_RE.search(u)]
 
 
+def _probe_video_dimensions(path: str) -> tuple[int, int] | None:
+    """Read the real *display* width/height straight from the downloaded
+    file with ffprobe. yt-dlp's format metadata is often missing or wrong
+    for some platforms (e.g. Facebook), which makes Telegram fall back to a
+    near-square preview box; and phone videos are frequently stored
+    landscape with a rotation flag, so the coded dimensions need swapping to
+    get the displayed orientation. Returns None if ffprobe isn't available
+    or can't read the file, so callers fall back to yt-dlp's metadata."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries",
+                "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+                "-of", "json", path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        streams = (json.loads(proc.stdout or "{}").get("streams")) or []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if not streams:
+        return None
+    stream = streams[0]
+    width, height = stream.get("width"), stream.get("height")
+    if not width or not height:
+        return None
+
+    rotation = 0
+    tag = (stream.get("tags") or {}).get("rotate")  # older ffmpeg
+    if tag is not None:
+        try:
+            rotation = int(tag)
+        except (TypeError, ValueError):
+            pass
+    for side_data in stream.get("side_data_list") or []:  # newer ffmpeg (Display Matrix)
+        if side_data.get("rotation") is not None:
+            try:
+                rotation = int(side_data["rotation"])
+            except (TypeError, ValueError):
+                pass
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
+    return width, height
+
+
+def _entry_from_file(path: str, info: dict, fmt: dict | None = None) -> dict:
+    """Build a media entry, preferring ffprobe's real display dimensions and
+    falling back to yt-dlp's metadata when ffprobe isn't available."""
+    fmt = fmt or {}
+    probed = _probe_video_dimensions(path)
+    if probed:
+        width, height = probed
+    else:
+        width = fmt.get("width") or info.get("width")
+        height = fmt.get("height") or info.get("height")
+    return {"path": path, "width": width, "height": height, "duration": info.get("duration")}
+
+
 def _paths_from_processed(ydl: "yt_dlp.YoutubeDL", info: dict) -> list[dict]:
     """Telegram renders a video with a wrong (often square) preview box
     unless width/height are passed explicitly with the upload, since it
-    can't always probe them itself - so carry yt-dlp's own metadata through
-    alongside each file path instead of just returning bare paths."""
+    can't always probe them itself - so carry each file's real dimensions
+    through alongside its path instead of just returning bare paths."""
     downloads = info.get("requested_downloads")
     if downloads:
         return [
-            {
-                "path": d["filepath"],
-                "width": d.get("width") or info.get("width"),
-                "height": d.get("height") or info.get("height"),
-                "duration": info.get("duration"),
-            }
+            _entry_from_file(d["filepath"], info, d)
             for d in downloads
             if d.get("filepath")
         ]
-    return [{
-        "path": ydl.prepare_filename(info),
-        "width": info.get("width"),
-        "height": info.get("height"),
-        "duration": info.get("duration"),
-    }]
+    return [_entry_from_file(ydl.prepare_filename(info), info)]
 
 
 def _best_candidate(candidates: list[dict]) -> dict | None:
@@ -699,9 +753,10 @@ def main() -> None:
     app.add_handler(CommandHandler("replies", replies_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info(
-        "bot starting (cookies=%s, temp_dir=%s)",
+        "bot starting (cookies=%s, temp_dir=%s, ffprobe=%s)",
         "yes" if COOKIES_FILE else "no",
         TEMP_DIR or tempfile.gettempdir(),
+        "yes" if shutil.which("ffprobe") else "no (video dimensions fall back to yt-dlp metadata)",
     )
     app.run_polling()
 
