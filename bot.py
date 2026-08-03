@@ -56,6 +56,12 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 # Telegram albums (sendMediaGroup) allow at most 10 items per call.
 MEDIA_GROUP_MAX = 10
 
+# Telegram limits: media captions max 1024 chars, text messages max 4096.
+# Kept slightly under to leave headroom (the API counts UTF-16 units, so
+# emoji etc. can push a 1024-"char" string over).
+CAPTION_LIMIT = 1000
+TEXT_MESSAGE_LIMIT = 4000
+
 URL_RE = re.compile(r"https?://\S+")
 SUPPORTED_DOMAINS_RE = re.compile(
     r"\b(?:instagram\.com|facebook\.com|fb\.watch|youtube\.com|youtu\.be|tiktok\.com"
@@ -226,7 +232,62 @@ def _bluesky_photo_candidates(post: dict) -> list[dict]:
     return out
 
 
-def download_media(url: str, dest_dir: str) -> list[dict]:
+def _dig(obj, *keys):
+    """Safe nested dict lookup; returns None if any level is missing."""
+    for k in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(k)
+    return obj
+
+
+def _twitter_post_text(status: dict | None) -> str | None:
+    if not status:
+        return None
+    # note_tweet holds the full text of long-form (premium) posts; full_text
+    # is the standard field. Both preserve the original newlines, unlike
+    # yt-dlp's own 'description' which flattens them to spaces.
+    return (
+        _dig(status, "note_tweet", "note_tweet_results", "result", "text")
+        or status.get("full_text")
+        or status.get("text")
+    )
+
+
+def _bluesky_post_text(post: dict | None) -> str | None:
+    return _dig(post, "record", "text")
+
+
+def _instagram_post_text(product_info: dict | None) -> str | None:
+    if not product_info:
+        return None
+    caption = product_info.get("caption")
+    if isinstance(caption, dict):
+        return caption.get("text")
+    if isinstance(caption, str):
+        return caption
+    return None
+
+
+def build_caption(text: str | None, url: str) -> tuple[str, str | None]:
+    """Combine the post text and source URL into a media caption. If the
+    combined length would exceed Telegram's caption limit, return just the
+    URL as the caption plus the full text as 'overflow' to send as separate
+    message(s), so long posts aren't truncated."""
+    text = (text or "").strip()
+    if not text:
+        return url, None
+    full = f"{text}\n\n{url}"
+    if len(full) <= CAPTION_LIMIT:
+        return full, None
+    return url, text
+
+
+def _chunk_text(text: str, size: int = TEXT_MESSAGE_LIMIT) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def download_media(url: str, dest_dir: str) -> dict:
     outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -307,13 +368,22 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
         # good) image data it just built. Intercept the raw product_media
         # dict right where the extractor builds it (same request, same
         # cookies/session already proven to work) before it gets lost,
-        # instead of guessing at separate endpoints.
+        # instead of guessing at separate endpoints. Also capture the parent
+        # product_info (via _extract_product) for the post's caption text.
         captured_media = []
-        original = _ig_extractor.InstagramBaseIE._extract_product_media
+        captured_product = []
+        original_media = _ig_extractor.InstagramBaseIE._extract_product_media
+        # Capturing the caption is a nice-to-have; guard it so a future
+        # yt-dlp rename of _extract_product can't break image downloading.
+        original_product = getattr(_ig_extractor.InstagramBaseIE, "_extract_product", None)
 
         def _capturing_extract_product_media(self, product_media):
             captured_media.append(product_media)
-            return original(self, product_media)
+            return original_media(self, product_media)
+
+        def _capturing_extract_product(self, product_info, *a, **k):
+            captured_product.append(product_info)
+            return original_product(self, product_info, *a, **k)
 
         def on_no_video(ydl, exc):
             if "no video in this post" not in str(exc).lower() or not captured_media:
@@ -327,10 +397,16 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
 
         with _capture_lock:
             _ig_extractor.InstagramBaseIE._extract_product_media = _capturing_extract_product_media
+            if original_product:
+                _ig_extractor.InstagramBaseIE._extract_product = _capturing_extract_product
             try:
-                return run(captured_media, on_no_video)
+                entries = run(captured_media, on_no_video)
             finally:
-                _ig_extractor.InstagramBaseIE._extract_product_media = original
+                _ig_extractor.InstagramBaseIE._extract_product_media = original_media
+                if original_product:
+                    _ig_extractor.InstagramBaseIE._extract_product = original_product
+        text = _instagram_post_text(captured_product[-1]) if captured_product else None
+        return {"entries": entries, "text": text}
 
     if re.search(r"\b(?:twitter\.com|x\.com)\b", url, re.IGNORECASE):
         # yt-dlp's Twitter extractor filters photo-type media out of a
@@ -368,9 +444,11 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
         with _capture_lock:
             _tw_extractor.TwitterIE._extract_status = _capturing_extract_status
             try:
-                return run([], on_no_video)
+                entries = run([], on_no_video)
             finally:
                 _tw_extractor.TwitterIE._extract_status = original
+        text = _twitter_post_text(captured_status[-1]) if captured_status else None
+        return {"entries": entries, "text": text}
 
     if re.search(r"\bbsky\.app\b", url, re.IGNORECASE):
         # Same situation again: yt-dlp's Bluesky extractor only ever builds
@@ -405,11 +483,13 @@ def download_media(url: str, dest_dir: str) -> list[dict]:
         with _capture_lock:
             _bsky_extractor.BlueskyIE._extract_post = _capturing_extract_post
             try:
-                return run([], on_no_video)
+                entries = run([], on_no_video)
             finally:
                 _bsky_extractor.BlueskyIE._extract_post = original
+        text = _bluesky_post_text(captured_post[-1]) if captured_post else None
+        return {"entries": entries, "text": text}
 
-    return run([])
+    return {"entries": run([]), "text": None}
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -434,18 +514,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         with tempfile.TemporaryDirectory(prefix="reel-", dir=TEMP_DIR) as tmp_dir:
             try:
-                downloaded = await asyncio.to_thread(download_media, url, tmp_dir)
-            except Exception as exc:  # noqa: BLE001 - surface any download failure to the user
+                result = await asyncio.to_thread(download_media, url, tmp_dir)
+            except Exception as exc:  # noqa: BLE001
+                # Failures are logged server-side but not posted to the chat,
+                # to avoid cluttering it with error messages.
                 log.warning("download failed for %s: %s", url, exc)
-                await status.edit_text(
-                    f"Couldn't download that link:\n{url}\n\nReason: {exc}"
-                )
+                await status.delete()
                 continue
+
+            downloaded = result["entries"]
+            post_text = result.get("text")
 
             if not downloaded:
                 log.info("nothing downloadable found at %s", url)
                 await status.delete()
                 continue
+
+            # The post's text (Twitter/Bluesky/Instagram) goes in the caption
+            # of the first media item; if too long for a caption it's sent as
+            # separate follow-up message(s) so it isn't truncated.
+            main_caption, overflow_text = build_caption(post_text, url)
+            caption_pending = True
 
             # Classify each downloaded file: photos/videos within Telegram's
             # per-type size limits can go in one album (sendMediaGroup);
@@ -479,11 +568,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 try:
                     with open(path, "rb") as f:
                         if kind == "photo":
-                            await message.reply_photo(photo=f, caption=url, do_quote=quote)
+                            await message.reply_photo(photo=f, caption=main_caption, do_quote=quote)
                         else:
                             await message.reply_video(
                                 video=f,
-                                caption=url,
+                                caption=main_caption,
                                 width=entry.get("width"),
                                 height=entry.get("height"),
                                 duration=entry.get("duration"),
@@ -491,6 +580,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 do_quote=quote,
                             )
                     sent_any = True
+                    caption_pending = False
                 except Exception as exc:  # noqa: BLE001
                     log.warning("upload failed for %s: %s", path, exc)
                     skipped.append((url, None))
@@ -498,13 +588,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 for start in range(0, len(groupable), MEDIA_GROUP_MAX):
                     chunk = groupable[start : start + MEDIA_GROUP_MAX]
                     files = [open(entry["path"], "rb") for _, entry in chunk]
+                    # Only the very first item of the whole post carries the
+                    # caption (Telegram shows it as the album's caption).
+                    captions = []
+                    for _ in chunk:
+                        captions.append(main_caption if caption_pending else None)
+                        caption_pending = False
                     try:
                         media = [
-                            (InputMediaPhoto(media=f, caption=url if start == 0 and i == 0 else None)
+                            (InputMediaPhoto(media=f, caption=captions[i])
                              if kind == "photo" else
                              InputMediaVideo(
                                  media=f,
-                                 caption=url if start == 0 and i == 0 else None,
+                                 caption=captions[i],
                                  width=entry.get("width"),
                                  height=entry.get("height"),
                                  duration=entry.get("duration"),
@@ -522,25 +618,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             f.close()
 
             for label, path in singles:
+                caption = main_caption if caption_pending else label
+                caption_pending = False
                 try:
                     with open(path, "rb") as f:
-                        await message.reply_document(document=f, caption=label, do_quote=quote)
+                        await message.reply_document(document=f, caption=caption, do_quote=quote)
                     sent_any = True
                 except Exception as exc:  # noqa: BLE001
                     log.warning("upload failed for %s: %s", path, exc)
                     skipped.append((label, None))
 
-            if skipped:
+            # If the post text was too long for a caption, send it as its own
+            # follow-up message(s) so nothing is lost.
+            if sent_any and overflow_text:
+                for chunk in _chunk_text(overflow_text):
+                    try:
+                        await message.reply_text(chunk, do_quote=quote)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("failed to send post text for %s: %s", url, exc)
+                        break
+
+            if skipped and sent_any:
+                # Partial success: some items went through, some didn't. Note
+                # only what couldn't be sent (e.g. a file over the size limit).
                 lines = [
                     f"- {c}" + (f" ({s / 1024 / 1024:.1f}MB, over the limit)" if s else " (failed to send)")
                     for c, s in skipped
                 ]
-                note = "Couldn't send:\n" + "\n".join(lines)
-                if sent_any:
-                    await status.delete()
-                    await message.reply_text(note, do_quote=quote)
-                else:
-                    await status.edit_text(note)
+                await status.delete()
+                await message.reply_text("Couldn't send:\n" + "\n".join(lines), do_quote=quote)
+            elif skipped:
+                # Nothing sent at all - stay quiet in the chat, just log it.
+                log.warning("couldn't send anything for %s: %s", url, skipped)
+                await status.delete()
             else:
                 await status.delete()
 

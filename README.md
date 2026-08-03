@@ -11,6 +11,13 @@ media, and replies in the same chat with it attached:
 - Twitter/X photos and videos (including multi-photo tweets)
 - Bluesky photos and videos (anonymous, no login needed)
 
+For Twitter/X, Bluesky, and Instagram posts, the full post text is attached
+as the media caption (and sent as a follow-up message if it's too long for
+a caption), since link previews often show only a truncated portion.
+
+Download failures aren't posted to the chat — they're logged server-side
+only, so a bad or unreachable link doesn't clutter the conversation.
+
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram
